@@ -306,6 +306,8 @@ function jsRoutes(src, f, out) {
   for (const u of uses) if (u.v === 'app' || u.v === 'server') out.push({ k: 'global-guard', framework: 'express', name: u.name, line: u.line });
 
   routes.forEach((r, idx) => {
+    // route tables and Bun.serve check logins in a dispatcher or wrapper this can't follow
+    if (r.framework === 'route-table' || r.framework === 'bun') return;
     const rec = { k: 'route', line: r.line, method: r.method };
     if (r.framework === 'firebase') {
       // a callable checks request.auth (v1: context.auth) or turns on App Check; an onRequest function
