@@ -22,6 +22,9 @@ test('a regex path becomes route paths: captures are parameters, literal alterna
     [String.raw`^\/files\/(.+)$`, ['/files/*']],
     [String.raw`^\/api\/orders\/(\d+)\/lines\/(\w+)\/?$`, ['/api/orders/:p1/lines/:p2']],
     [String.raw`^\/api\/report\.csv$`, ['/api/report.csv']],
+    [String.raw`^\/api\/items(?:\/)?$`, ['/api/items']],
+    [String.raw`^\/api\/items\/([^/]+)(?:\/edit)?$`, ['/api/items/:p1', '/api/items/:p1/edit']],
+    [String.raw`^\/api\/a$|^\/shop\/b$`, ['/api/a', '/shop/b']],
   ];
   for (const [source, paths] of cases) assert.deepEqual(regexRoutePaths(source), paths, source);
 });
@@ -29,6 +32,11 @@ test('a regex path becomes route paths: captures are parameters, literal alterna
 test('up to eight combinations expand; a group that would pass eight becomes a wildcard segment', () => {
   assert.equal(regexRoutePaths(String.raw`^\/api\/(?:aa|bb)\/(?:cc|dd)\/(?:ee|ff)$`).length, 8);
   assert.deepEqual(regexRoutePaths(String.raw`^\/api\/(?:aa|bb|cc)\/(?:dd|ee|ff)$`), ['/api/aa/*', '/api/bb/*', '/api/cc/*']);
+  // the eight are counted across the whole regex, not per alternative
+  assert.deepEqual(
+    regexRoutePaths(String.raw`^\/api\/(?:aa|bb|cc|dd|ee)$|^\/shop\/(?:ff|gg|hh|ii)$`),
+    ['/api/aa', '/api/bb', '/api/cc', '/api/dd', '/api/ee', '/shop/*'],
+  );
 });
 
 test('odd or unanchored regexes never throw and only yield paths with a real word in them', () => {
@@ -38,6 +46,10 @@ test('odd or unanchored regexes never throw and only yield paths with a real wor
     for (const p of paths) assert.match(p, /^\/(?:.*\/)?[A-Za-z]{2,}/, `${source} -> ${p}`);
   }
   assert.deepEqual(regexRoutePaths('^\\/([^/]+)$'), []);
+  // regex syntax left in a segment drops that path rather than widening it to match anything
+  assert.deepEqual(regexRoutePaths(String.raw`^\/api\/report.csv$`), []);
+  assert.deepEqual(regexRoutePaths(String.raw`^\/api\/(?:items|orders)+$`), []);
+  assert.deepEqual(regexRoutePaths(String.raw`^\/api\/item-(\d+)$`), []);
   assert.deepEqual(regexRoutePaths('api\\/items'), []);
 });
 
@@ -117,8 +129,36 @@ test('Bun.serve routes: method objects give one endpoint per method, anything el
     'ANY /api/ping bun L12 -',
     'ANY /api/health bun L13 healthHandler',
   ]);
+  // with a type argument for websocket data
+  assert.deepEqual(routesOf(src.replace('Bun.serve(', 'Bun.serve<SocketData>('), 'server/index.ts').length, 7);
   // the same object outside a file that starts Bun.serve is just data
   assert.deepEqual(routesOf(src.replace('Bun.serve(', 'configure('), 'server/index.ts'), []);
+});
+
+test('Health still reads the login check of an Express route in a file that also has a route table', () => {
+  const mixed = makeProject({
+    'api/package.json': JSON.stringify({ name: 'api', dependencies: { express: '^4' } }),
+    'api/routes.js': [
+      `import express from 'express';`,
+      `const router = express.Router();`,
+      `router.get('/api/notes', (req, res) => res.json([]));`,
+      `export const ROUTES = [{ method: "GET", path: "/api/catalog", handle: listCatalog }];`,
+      `router.get('/api/admin/stats', (req, res) => {`,
+      `  if (!req.user) return res.status(401).end();`,
+      `  res.json({});`,
+      `});`,
+      `export default router;`,
+    ].join('\n'),
+  }, { arch: { project: { name: 'mixed', summary: 'Test fixture.' }, nodes: [{ id: 'api', label: 'API', kind: 'service', summary: 'The API.', paths: ['api/**'] }] } });
+  try {
+    run('scan.mjs', mixed);
+    run('build.mjs', mixed, '--no-claude-md');
+    const g = readGraph(mixed);
+    assert.deepEqual(routeKeys(g), ['GET /api/admin/stats', 'GET /api/catalog', 'GET /api/notes']);
+    assert.deepEqual(openEndpoints(g), ['GET /api/notes']);
+  } finally {
+    cleanup(mixed);
+  }
 });
 
 let root, graph;

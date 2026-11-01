@@ -159,6 +159,7 @@ function parseAtom(src, pos) {
   if (c === '[') return parseClass(src, pos);
   if (c === '(') return parseGroup(src, pos);
   if (c === '.') return { t: 'class', spans: true };
+  if (c === '^' || c === '$') return { t: 'anchor' };
   if (/[\w\-~%@/]/.test(c)) return { t: 'lit', v: c };
   return { t: 'syntax' };
 }
@@ -177,47 +178,73 @@ function parseAlternatives(src, pos) {
 }
 
 const spans = (alts) => alts.some((seq) => seq.some((a) => a.v === '/' || a.spans || (a.alts && spans(a.alts))));
-const plainLiteral = (seq) => seq.every((a) => a.t === 'lit' && !a.q && a.v !== '/');
+const plainLiteral = (seq) => seq.every((a) => a.t === 'lit' && !a.q);
+const optional = (q) => q === '?' || q === '??';
 
-/** One atom as the strings it can stand for, given how many variants exist so far. */
-function renderAtom(a, count) {
-  if (a.t === 'skip') return [''];
-  if (a.t === 'lit') return [a.q ? SYNTAX : a.v];
-  if (a.t === 'class') return [!a.q || a.q.startsWith('?') ? SYNTAX : a.spans ? STAR : PARAM];
-  if (a.t !== 'group') return [SYNTAX];
-  if (a.capture) return [spans(a.alts) ? STAR : a.q ? SYNTAX : PARAM];
-  if (!a.q && a.alts.every(plainLiteral)) {
-    return count * a.alts.length > MAX_EXPANSIONS ? [STAR] : a.alts.map((seq) => seq.map((x) => x.v).join(''));
-  }
-  return [spans(a.alts) ? STAR : SYNTAX];
+/**
+ * A group of plain words as the strings it stands for: `(?:mails|inbox)` → two, `(?:\/edit)?` → with and
+ * without. Past the expansion budget, a group within one path segment matches any segment; otherwise null.
+ */
+function groupOptions(a, count, room) {
+  if (a.q && !optional(a.q)) return [SYNTAX];
+  const options = a.alts.map((seq) => seq.map((x) => x.v).join(''));
+  if (a.q) options.unshift('');
+  if (count * options.length <= room) return options;
+  return !a.q && !spans(a.alts) ? [STAR] : [SYNTAX];
 }
 
-/** Marked-up variant → route path: parameters numbered in order, any other regex syntax a wildcard segment. */
+/** One atom as the strings it can stand for, given how many variants exist so far and the room left. */
+function renderAtom(a, count, room) {
+  if (a.t === 'skip') return [''];
+  if (a.t === 'lit') return [a.q ? SYNTAX : a.v];
+  if (a.t === 'class') return [!a.q || optional(a.q) ? SYNTAX : a.spans ? STAR : PARAM];
+  if (a.t !== 'group') return [SYNTAX];
+  if (a.capture) return [a.q ? SYNTAX : spans(a.alts) ? STAR : PARAM];
+  return a.alts.every(plainLiteral) ? groupOptions(a, count, room) : [SYNTAX];
+}
+
+/**
+ * Marked-up variant → route path: parameters numbered in order, `.*` and spanning captures a wildcard
+ * segment. Leftover regex syntax, a capture inside a word, or no real word: null, so an odd regex never
+ * widens to match anything.
+ */
 function toRoutePath(variant) {
   let n = 0;
   const segs = variant.split('/');
-  if (segs[0] !== '') return null;
-  const out = segs.slice(1).filter(Boolean).map((s) => (s === PARAM ? `:p${++n}` : /[\u0001-\u0003]/.test(s) ? '*' : s));
+  if (segs[0] !== '' || variant.includes(SYNTAX)) return null;
+  const out = segs.slice(1).filter(Boolean).map((s) => (s === PARAM ? `:p${++n}` : s.includes(PARAM) ? null : s.includes(STAR) ? '*' : s));
+  if (out.includes(null)) return null;
   return out.some((s) => /[A-Za-z]{2,}/.test(s) && !s.startsWith(':')) ? '/' + out.join('/') : null;
+}
+
+/** One top-level alternative, without its anchors and a trailing optional slash. */
+function branchAtoms(seq) {
+  const atoms = [...seq];
+  while (atoms[0]?.t === 'anchor') atoms.shift();
+  while (atoms.at(-1)?.t === 'anchor') atoms.pop();
+  const last = atoms.at(-1);
+  if (last?.t === 'lit' && last.v === '/' && optional(last.q)) atoms.pop();
+  return atoms;
 }
 
 /**
  * The route paths a path-matching regex stands for (source without slashes or flags):
- * `^\/api\/items\/([^/]+)$` → ['/api/items/:p1']. Lookarounds are dropped, a non-capturing group of
- * plain words expands into one path each (up to 8 combined), and anything that can span `/` is `*`.
- * Returns [] for anything without a leading `/` and a real word; never throws.
+ * `^\/api\/items\/([^/]+)$` → ['/api/items/:p1']. Each top-level alternative converts on its own;
+ * lookarounds are dropped, groups of plain words expand (up to 8 paths per regex), and only `.*` or a
+ * capture that can span `/` becomes `*`. Returns [] for anything else; never throws.
  */
 export function regexRoutePaths(source) {
-  const src = source.replace(/^\^/, '').replace(/\$$/, '').replace(/\\\/\?$/, '');
   const pos = { i: 0 };
-  const top = parseAlternatives(src, pos);
-  if (pos.i < src.length) return [];
+  const top = parseAlternatives(source, pos);
+  if (pos.i < source.length) return [];
+  let total = 0;
   const paths = top.flatMap((seq) => {
     let variants = [''];
-    for (const atom of seq) {
-      const parts = renderAtom(atom, variants.length);
+    for (const atom of branchAtoms(seq)) {
+      const parts = renderAtom(atom, variants.length, MAX_EXPANSIONS - total);
       variants = variants.flatMap((v) => parts.map((p) => v + p));
     }
+    total += variants.length;
     return variants.map(toRoutePath).filter(Boolean);
   });
   return [...new Set(paths)];
@@ -258,7 +285,7 @@ function routeTableRoutes(code, at) {
 
 /** `routes: { "/api/x": { GET: a, POST: b }, "/y": handler }` in a file that starts Bun.serve. */
 function bunRoutes(code, at) {
-  if (!code.includes('Bun.serve(')) return [];
+  if (!/\bBun\.serve\s*(?:<[^>]*>)?\s*\(/.test(code)) return [];
   const routes = [];
   for (const m of code.matchAll(/\broutes\s*:\s*\{/g)) {
     for (const e of entries(code, m.index + m[0].length - 1)) {
